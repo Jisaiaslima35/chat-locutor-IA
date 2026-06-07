@@ -1,0 +1,6 @@
+{
+  "name": "Web Radio Chat",
+  "description": "Chat público em tempo real para rádio web com integração ao bot Hermes, suporte a moderação e sincronização com Supabase.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
