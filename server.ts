@@ -53,7 +53,7 @@ async function saveMessage(usuario: string, mensagem: string, tipo: "usuario" | 
         .select();
 
       if (error) {
-        console.error("Error inserting into Supabase: ", error);
+        console.error("Error inserting into Supabase: ", JSON.stringify(error, null, 2));
         localMessages.push(messageData); // fallback
         return messageData;
       }
@@ -92,7 +92,7 @@ async function getLastMessages(): Promise<ChatMessage[]> {
         .limit(50);
 
       if (error) {
-        console.error("Error querying Supabase: ", error);
+        console.error("Error querying Supabase: ", JSON.stringify(error, null, 2));
         return [...localMessages].reverse(); // fallback
       }
       
