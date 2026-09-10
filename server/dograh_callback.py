@@ -202,27 +202,55 @@ def fetch_transcript(run: dict, dograh_token: str) -> str | None:
     return data[:8000]
 
 
-def summarize_lead(transcript: str) -> dict:
+def _build_lead_corpus(transcript: str, user_inputs: list) -> str:
+    """Combina transcrição de áudio + inputs textuais do frontend num corpus único.
+    Frontend v1.0.5+ envia user_inputs (texto digitado no input flutuante) que
+    NÃO aparece na transcrição WebRTC do Dograh. Sem esse merge, lead vira
+    'anônimo' mesmo quando o usuário digitou nome + interesse (msg 4187/4188)."""
+    parts = []
+    if transcript:
+        parts.append("[TRANSCRIÇÃO DE VOZ]\n" + transcript.strip())
+    if user_inputs:
+        items = []
+        for x in user_inputs:
+            if isinstance(x, dict):
+                t = (x.get("text") or "").strip()
+                if t:
+                    items.append("- " + t)
+            elif isinstance(x, str):
+                t = x.strip()
+                if t:
+                    items.append("- " + t)
+        if items:
+            parts.append("[INPUTS DIGITADOS PELO USUÁRIO NO CHAT]\n" + "\n".join(items))
+    return "\n\n".join(parts)
+
+
+def summarize_lead(transcript: str, user_inputs: list = None) -> dict:
     """Q2=b: MiniMax MiniMax extrai {nome, interesse, dor, proximo_passo}. Fallback regex."""
+    user_inputs = user_inputs or []
+    corpus = _build_lead_corpus(transcript, user_inputs)
     empty = {"name": None, "interest": None, "pain": None, "next_step": None}
-    if not transcript or len(transcript) < 20:
+
+    if not corpus or len(corpus) < 20:
         # Regex fallback pra nome mesmo sem LLM
-        m = re.search(r"(?:meu nome é|me chamo|sou o|sou a)\s+([A-ZÀ-Ú][a-zà-ú]+(?:\s+[A-ZÀ-Ú][a-zà-ú]+)?)", transcript or "", re.IGNORECASE)
+        m = re.search(r"(?:meu nome é|me chamo|sou o|sou a)\s+([A-ZÀ-Ú][a-zà-ú]+(?:\s+[A-ZÀ-Ú][a-zà-ú]+)?)", corpus or "", re.IGNORECASE)
         empty["name"] = m.group(1) if m else None
         return empty
 
     if not MINIMAX_API_KEY:
-        m = re.search(r"(?:meu nome é|me chamo|sou o|sou a)\s+([A-ZÀ-Ú][a-zà-ú]+(?:\s+[A-ZÀ-Ú][a-zà-ú]+)?)", transcript, re.IGNORECASE)
+        m = re.search(r"(?:meu nome é|me chamo|sou o|sou a)\s+([A-ZÀ-Ú][a-zà-ú]+(?:\s+[A-ZÀ-Ú][a-zà-ú]+)?)", corpus, re.IGNORECASE)
         empty["name"] = m.group(1) if m else None
         return empty
 
     prompt = (
-        "Você é um extrator de leads. Analise a transcrição de uma chamada de vendas "
-        "em português e devolva APENAS JSON válido com 4 campos: nome (string ou null), "
-        "interesse (um de: radio|ebook|crm|automacao|outro|null), dor (citada pelo lead, "
-        "ou null), proximo_passo (combinado na chamada, ou null). Não invente dados. "
-        "Se não tiver certeza, use null.\n\nTranscrição:\n\"\"\""
-        + transcript[:3000]
+        "Você é um extrator de leads. Analise o corpus abaixo (transcrição de voz + "
+        "mensagens digitadas pelo usuário no chat) de uma chamada de vendas em "
+        "português e devolva APENAS JSON válido com 4 campos: nome (string ou null), "
+        "interesse (um de: radio|ebook|crm|automacao|outro|null), dor (citada pelo "
+        "lead, ou null), proximo_passo (combinado na chamada, ou null). Não invente "
+        "dados. Se não tiver certeza, use null.\n\nCorpus:\n\"\"\""
+        + corpus[:4000]
         + "\"\"\""
     )
     # MiniMax M3 expõe Anthropic-compat em /v1/messages (NÃO /v1/chat/completions)
@@ -286,6 +314,19 @@ def notify_telegram(summary: dict) -> dict:
         lines.append(f"➡️ Próximo passo: {summary['lead']['next_step']}")
     if summary.get("disposition"):
         lines.append(f"🏷️ Disposição: {summary['disposition']}")
+    if summary.get("user_inputs"):
+        sample = []
+        for x in summary["user_inputs"][:5]:
+            if isinstance(x, dict):
+                t = (x.get("text") or "").strip()
+                if t:
+                    sample.append(f"• {t[:120]}")
+            elif isinstance(x, str):
+                sample.append(f"• {x[:120]}")
+        if sample:
+            lines.append("")
+            lines.append("⌨️ Digitou no chat:")
+            lines.extend(sample)
     lines.append("")
     if summary.get("transcript_preview"):
         lines.append(f"📝 {summary['transcript_preview']}")
@@ -437,6 +478,14 @@ class Handler(BaseHTTPRequestHandler):
             duration = 0
         visitor_ip = (self.headers.get("X-Forwarded-For") or self.client_address[0] or "0.0.0.0").split(",")[0].strip()
         page_url = body.get("page_url") or body.get("pageUrl") or self.headers.get("Referer")
+        # v1.0.5+: lista de textos digitados pelo usuário no input flutuante
+        # (Dograh não aceita texto via WS signaling — só WebRTC de áudio). Esses
+        # itens NUNCA aparecem em transcript_text, então mesclamos no corpus.
+        user_inputs_raw = body.get("user_inputs") or body.get("userInputs") or []
+        if isinstance(user_inputs_raw, list):
+            user_inputs = [x for x in user_inputs_raw if x]
+        else:
+            user_inputs = []
 
         if not run_id:
             return self._send(400, {"error": "workflow_run_id_required"})
@@ -481,7 +530,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"error": "run_not_found", "workflow_run_id": run_id})
 
         transcript = fetch_transcript(run, dograh_token)
-        lead = summarize_lead(transcript or "")
+        lead = summarize_lead(transcript or "", user_inputs=user_inputs)
         actual_duration = duration or run.get("call_duration_seconds") or (run.get("cost_info") or {}).get("call_duration_seconds") or 0
 
         record = {
@@ -499,6 +548,7 @@ class Handler(BaseHTTPRequestHandler):
             "lead_next_step": lead.get("next_step"),
             "visitor_ip": visitor_ip,
             "visitor_page_url": page_url,
+            "user_inputs_json": user_inputs,
         }
 
         ok, inserted = insert_call(record)
@@ -514,6 +564,7 @@ class Handler(BaseHTTPRequestHandler):
             "recording_url": run.get("recording_url"),
             "page_url": page_url,
             "lead": lead,
+            "user_inputs": user_inputs,
         })
         if tg.get("ok"):
             update_call(call_id, {"telegram_notified": True, "telegram_message_id": tg.get("message_id")})
