@@ -37,6 +37,19 @@ DOGRAH_WORKFLOW_ID = int(os.environ.get("DOGRAH_WORKFLOW_ID", "6"))
 DOGRAH_USER_EMAIL = os.environ.get("DOGRAH_USER_EMAIL", "isaiassilva356@gmail.com")
 DOGRAH_USER_PASSWORD = os.environ.get("DOGRAH_USER_PASSWORD", "")
 
+# === B1 (Set/2026): embed config injetado dinamicamente ===
+# Antes o token embed ia hardcoded no index.html (view-source leak).
+# Agora o frontend faz fetch /api/dograh/config e o backend serve do env.
+DOGRAH_EMBED_TOKEN = os.environ.get("DOGRAH_EMBED_TOKEN", "").strip()
+DOGRAH_PUBLIC_URL = os.environ.get("DOGRAH_PUBLIC_URL", "https://dograh.automacaojs.us").rstrip("/")
+
+# === B4 (Set/2026): HMAC validation de webhook ===
+# Quando DOGRAH_WEBHOOK_SECRET está setado, valida X-Dograh-Signature: sha256=<hex>
+# calculado sobre o body raw. Sem secret setado → modo compat (aceita sem validar).
+# Quando Dograh começar a mandar a assinatura, basta setar o secret no env
+# do serviço systemd e reiniciar — sem mudar código.
+DOGRAH_WEBHOOK_SECRET = os.environ.get("DOGRAH_WEBHOOK_SECRET", "").strip()
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://yfnzlowtgnlqizobnslh.supabase.co")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "") or os.environ.get("SUPABASE_ANON_KEY", "")
 
@@ -431,6 +444,32 @@ def find_existing_run(run_id: int):
     return None
 
 
+
+def _verify_webhook_hmac(raw_body: bytes, signature_header: str | None) -> tuple[bool, str]:
+    """Verifica X-Dograh-Signature: sha256=<hex> contra HMAC-SHA256 do body raw.
+    Retorna (ok, motivo). Modo compat: sem secret setado, aceita sem validar
+    (mas loga warning). Modo strict: secret setado exige signature valida."""
+    if not DOGRAH_WEBHOOK_SECRET:
+        return True, "no_secret_configured"  # modo compat (B4 desabilitado)
+    if not signature_header:
+        return False, "missing_signature"
+    sig = signature_header.strip()
+    if sig.startswith("sha256="):
+        sig = sig[len("sha256="):]
+    try:
+        import hmac, hashlib
+        expected = hmac.new(
+            DOGRAH_WEBHOOK_SECRET.encode("utf-8"),
+            raw_body,
+            hashlib.sha256,
+        ).hexdigest()
+    except Exception as e:
+        return False, f"hmac_error:{e}"
+    if hmac.compare_digest(expected.lower(), sig.lower()):
+        return True, "valid"
+    return False, "signature_mismatch"
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         sys.stderr.write(f"[dograh-callback] {self.address_string()} {format % args}\n")
@@ -454,6 +493,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health" or self.path.startswith("/health?"):
             return self._send(200, {"ok": True, "service": "dograh-callback", "port": PORT})
+        # === B1 (Set/2026): serve embed config dinamicamente ===
+        # Frontend faz fetch /api/dograh/config antes de carregar o widget script.
+        # Token NUNCA vai hardcoded no HTML; so serve aqui se o env tiver.
+        if self.path == "/api/dograh/config" or self.path.startswith("/api/dograh/config?"):
+            if not DOGRAH_EMBED_TOKEN:
+                return self._send(503, {"error": "embed_token_not_configured"})
+            return self._send(200, {
+                "token": DOGRAH_EMBED_TOKEN,
+                "apiEndpoint": DOGRAH_PUBLIC_URL,
+                "workflowId": DOGRAH_WORKFLOW_ID,
+            })
         return self._send(404, {"error": "not_found"})
 
     def do_POST(self):
@@ -467,6 +517,26 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw.decode("utf-8") or "{}")
         except Exception:
             return self._send(400, {"error": "invalid_json"})
+
+        # === B4 (Set/2026): HMAC validation ===
+        # Quando DOGRAH_WEBHOOK_SECRET setado, exige X-Dograh-Signature valido.
+        # Sem secret → modo compat (aceita sem validar, loga warning).
+        sig_header = self.headers.get("X-Dograh-Signature") or self.headers.get("X-Signature")
+        ok_sig, sig_reason = _verify_webhook_hmac(raw, sig_header)
+        if not ok_sig:
+            visitor_ip_pre = (self.headers.get("X-Forwarded-For") or self.client_address[0] or "0.0.0.0").split(",")[0].strip()
+            notify_telegram_alert(
+                reason=f"hmac_rejected:{sig_reason}",
+                run_id=int((body or {}).get("workflow_run_id") or (body or {}).get("workflowRunId") or 0) or 0,
+                visitor_ip=visitor_ip_pre,
+                page_url=(body or {}).get("page_url") or (body or {}).get("pageUrl") or self.headers.get("Referer") or "",
+                extra="callback REJEITADO (HMAC invalido) - possivel injecao de lead falso",
+            )
+            sys.stderr.write(f"[dograh-callback] HMAC rejected ({sig_reason}) ip={visitor_ip_pre}\n")
+            return self._send(401, {"error": "invalid_signature", "reason": sig_reason})
+        elif DOGRAH_WEBHOOK_SECRET:
+            # Modo strict: passou na validacao. Log discreto.
+            sys.stderr.write(f"[dograh-callback] HMAC OK ip={self.client_address[0]}\n")
 
         try:
             run_id = int(body.get("workflow_run_id") or body.get("workflowRunId") or 0)
