@@ -7,6 +7,8 @@ import { createServer as createViteServer } from "vite";
 import * as dotenv from "dotenv";
 import { getSupabase, isSupabaseConfigured } from "./src/lib/supabase.js";
 import { ChatMessage, UserSession } from "./src/types.js";
+// Dograh integration: handled by Python stdlib service site-dograh-callback.service (port 8129)
+// proxied via nginx location /api/dograh/. Do NOT add Express routes here — production is nginx-static.
 
 dotenv.config();
 
@@ -21,6 +23,9 @@ app.use(cors({
 }));
 
 app.use(express.json());
+
+// Dograh integration: handled by Python stdlib service site-dograh-callback.service (port 8129)
+// proxied via nginx location /api/dograh/. Do NOT add Express routes here — production is nginx-static.
 
 // In-Memory Fallback State (when Supabase is not configured or offline)
 const localMessages: ChatMessage[] = [];
